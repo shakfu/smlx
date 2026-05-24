@@ -1,22 +1,16 @@
 /*
- * smlx -- minimal C generate loop for a Llama-style transformer on top of mlx-c.
+ * smlx CLI -- thin wrapper around libsmlx.
  *
- * Scope: prefill + KV-cached decode with argmax sampling. No tokenizer:
- * prompt is supplied as integer token ids on the command line, and generated
- * ids are printed as integers. Plug a tokenizer in front and behind to get text.
+ * Reads a config file and safetensors weights, then runs a prefill +
+ * one-token-per-line decode loop. Sampling and EOS configured via env vars.
  *
- * Assumed weight naming (HF / mlx-lm Llama):
- *   model.embed_tokens.weight                          [vocab, dim]
- *   model.layers.{i}.input_layernorm.weight            [dim]
- *   model.layers.{i}.self_attn.{q,k,v,o}_proj.weight   [out, in]
- *   model.layers.{i}.post_attention_layernorm.weight   [dim]
- *   model.layers.{i}.mlp.{gate,up,down}_proj.weight    [out, in]
- *   model.norm.weight                                  [dim]
- *   lm_head.weight                                     [vocab, dim]  (optional; falls back to tied embeddings)
+ * Usage:
+ *   smlx <config.txt> <weights.safetensors> <max_new> [<prompt_id> ...]
+ * If prompt ids are not on argv, they are read from stdin (whitespace-separated).
  *
- * Config is a simple key=value text file. Required keys:
- *   n_layers, dim, n_heads, n_kv_heads, head_dim, hidden_dim,
- *   vocab_size, rope_theta, norm_eps
+ * Env:
+ *   SMLX_TEMP, SMLX_TOP_K, SMLX_TOP_P, SMLX_SEED -- sampling
+ *   SMLX_EOS -- comma-separated stop ids (break decode when sampled)
  */
 
 #include <stdbool.h>
@@ -24,707 +18,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
 #include <time.h>
 
-#include "mlx/c/mlx.h"
+#include "smlx.h"
 
 static double now_s(void) {
   struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
   return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
-
-/* ---------- error handling ---------- */
-
-#define CHECK(call) do { \
-  if ((call) != 0) { \
-    fprintf(stderr, "mlx call failed at %s:%d: %s\n", __FILE__, __LINE__, #call); \
-    exit(1); \
-  } \
-} while (0)
-
-/* ---------- config ---------- */
-
-typedef struct {
-  int n_layers;
-  int dim;
-  int n_heads;
-  int n_kv_heads;
-  int head_dim;
-  int hidden_dim;
-  int vocab_size;
-  float rope_theta;
-  float norm_eps;
-  /* Llama-3 RoPE scaling. Set rope_original_max_pos > 0 to enable. */
-  float rope_factor;            /* e.g. 32.0 */
-  float rope_low_freq_factor;   /* e.g. 1.0  */
-  float rope_high_freq_factor;  /* e.g. 4.0  */
-  int   rope_original_max_pos;  /* e.g. 8192. 0 disables scaling. */
-  /* Quantization (auto-detected at load time). */
-  bool  quantized;
-  int   q_bits;        /* e.g. 4 */
-  int   q_group_size;  /* e.g. 64 */
-} Config;
-
-static void parse_config(const char* path, Config* c) {
-  memset(c, 0, sizeof(*c));
-  c->rope_theta = 10000.0f;
-  c->norm_eps = 1e-5f;
-  c->rope_factor = 1.0f;
-  c->rope_low_freq_factor = 1.0f;
-  c->rope_high_freq_factor = 4.0f;
-  c->rope_original_max_pos = 0;
-  FILE* f = fopen(path, "r");
-  if (!f) { fprintf(stderr, "cannot open config %s\n", path); exit(1); }
-  char line[256];
-  while (fgets(line, sizeof(line), f)) {
-    char k[64]; char v[128];
-    if (sscanf(line, " %63[^= \t] = %127s", k, v) != 2) continue;
-    if      (!strcmp(k, "n_layers"))   c->n_layers   = atoi(v);
-    else if (!strcmp(k, "dim"))        c->dim        = atoi(v);
-    else if (!strcmp(k, "n_heads"))    c->n_heads    = atoi(v);
-    else if (!strcmp(k, "n_kv_heads")) c->n_kv_heads = atoi(v);
-    else if (!strcmp(k, "head_dim"))   c->head_dim   = atoi(v);
-    else if (!strcmp(k, "hidden_dim")) c->hidden_dim = atoi(v);
-    else if (!strcmp(k, "vocab_size")) c->vocab_size = atoi(v);
-    else if (!strcmp(k, "rope_theta")) c->rope_theta = (float)atof(v);
-    else if (!strcmp(k, "norm_eps"))   c->norm_eps   = (float)atof(v);
-    else if (!strcmp(k, "rope_factor"))            c->rope_factor            = (float)atof(v);
-    else if (!strcmp(k, "rope_low_freq_factor"))   c->rope_low_freq_factor   = (float)atof(v);
-    else if (!strcmp(k, "rope_high_freq_factor"))  c->rope_high_freq_factor  = (float)atof(v);
-    else if (!strcmp(k, "rope_original_max_pos"))  c->rope_original_max_pos  = atoi(v);
-    else if (!strcmp(k, "q_bits"))                 c->q_bits                 = atoi(v);
-    else if (!strcmp(k, "q_group_size"))           c->q_group_size           = atoi(v);
-  }
-  fclose(f);
-}
-
-/* ---------- weight handles ---------- */
-
-/* A linear layer: dense (w pre-transposed, scales/biases empty) or quantized
- * (w = packed uint32 [out, in/pack], scales/biases populated). The forward
- * branches on Config.quantized. */
-typedef struct {
-  mlx_array w;
-  mlx_array scales;
-  mlx_array biases;
-} QLinear;
-
-typedef struct {
-  mlx_array attn_norm;
-  mlx_array ffn_norm;
-  QLinear   wq, wk, wv, wo;
-  QLinear   w_gate, w_up, w_down;
-} LayerW;
-
-typedef struct {
-  mlx_array tok_embed;          /* [vocab, dim], dense (dequantized if needed) */
-  mlx_array norm;               /* [dim]        */
-  QLinear   lm_head;            /* dense: w = embed.T; quantized: same triple as tied embed */
-  LayerW* layers;               /* length n_layers */
-  /* RoPE precomputed inverse frequencies (length head_dim/2). Empty handle = disabled. */
-  mlx_array rope_freqs;
-  float*    rope_freqs_buf;     /* owns backing store for rope_freqs */
-  bool      use_rope_freqs;
-} Weights;
-
-/* Look up a weight by key and remove it from the map (we keep our own ref). */
-static mlx_array take_weight(mlx_map_string_to_array data, const char* key, bool required) {
-  mlx_array a = mlx_array_new();
-  if (mlx_map_string_to_array_get(&a, data, key) != 0) {
-    if (required) { fprintf(stderr, "missing weight: %s\n", key); exit(1); }
-    mlx_array_free(a);
-    return mlx_array_new();
-  }
-  return a;
-}
-
-/* Transpose a 2D weight to make it directly usable on the right of matmul. */
-static mlx_array transpose_2d(mlx_array w, mlx_stream s) {
-  mlx_array t = mlx_array_new();
-  CHECK(mlx_transpose(&t, w, s));
-  mlx_array_free(w);
-  return t;
-}
-
-static void eval_weight(mlx_array a) { CHECK(mlx_array_eval(a)); }
-
-/* Build Llama-3 scaled RoPE "freqs" for mlx_fast_rope.
- *
- * mlx_fast_rope's `freqs` parameter takes PERIODS, i.e. theta^(2i/d) -- not
- * angular inverse-frequencies. This matches mlx-lm's Llama3RoPE. The scaling
- * therefore works on periods:
- *   period_i  = theta^(2i / head_dim),    i in [0, head_dim/2)
- *   wavelen_i = 2*pi * period_i
- *   if wavelen < high_wl: keep
- *   if wavelen > low_wl : period * factor       (stretch long waves further)
- *   else                : period / ((1-s)/factor + s),  s = (old_ctx/wl - lo)/(hi-lo)
- */
-static void build_rope_freqs(Weights* W, const Config* c) {
-  if (c->rope_original_max_pos <= 0 || c->rope_factor == 1.0f) {
-    W->use_rope_freqs = false;
-    W->rope_freqs = mlx_array_new();
-    W->rope_freqs_buf = NULL;
-    return;
-  }
-  int half = c->head_dim / 2;
-  float* buf = malloc(sizeof(float) * (size_t)half);
-  const float theta  = c->rope_theta;
-  const float factor = c->rope_factor;
-  const float lo_f   = c->rope_low_freq_factor;
-  const float hi_f   = c->rope_high_freq_factor;
-  const float old_ctx = (float)c->rope_original_max_pos;
-  const float low_wl  = old_ctx / lo_f;
-  const float high_wl = old_ctx / hi_f;
-  for (int i = 0; i < half; i++) {
-    float p = powf(theta, (float)(2 * i) / (float)c->head_dim);
-    float wl = 2.0f * (float)M_PI * p;
-    float np;
-    if (wl < high_wl) {
-      np = p;
-    } else if (wl > low_wl) {
-      np = p * factor;
-    } else {
-      float smooth = (old_ctx / wl - lo_f) / (hi_f - lo_f);
-      np = p / ((1.0f - smooth) / factor + smooth);
-    }
-    buf[i] = np;
-  }
-  int sh[1] = { half };
-  W->rope_freqs = mlx_array_new_data(buf, sh, 1, MLX_FLOAT32);
-  W->rope_freqs_buf = buf;
-  W->use_rope_freqs = true;
-  CHECK(mlx_array_eval(W->rope_freqs));
-}
-
-/* Load a linear's weights. For dense: takes `.weight`, transposes to [in,out].
- * For quantized: takes `.weight` (packed uint32), `.scales`, `.biases` as-is. */
-static void load_qlinear(QLinear* q, mlx_map_string_to_array data, const char* base,
-                         const Config* c, mlx_stream s) {
-  char key[160];
-  snprintf(key, sizeof(key), "%s.weight", base);
-  if (c->quantized) {
-    q->w = take_weight(data, key, true);
-    snprintf(key, sizeof(key), "%s.scales", base); q->scales = take_weight(data, key, true);
-    snprintf(key, sizeof(key), "%s.biases", base); q->biases = take_weight(data, key, true);
-  } else {
-    q->w = transpose_2d(take_weight(data, key, true), s);
-    q->scales = mlx_array_new();
-    q->biases = mlx_array_new();
-  }
-}
-
-static void free_qlinear(QLinear* q) {
-  mlx_array_free(q->w); mlx_array_free(q->scales); mlx_array_free(q->biases);
-}
-
-static void eval_qlinear(QLinear* q) {
-  eval_weight(q->w);
-  if (q->scales.ctx) eval_weight(q->scales);
-  if (q->biases.ctx) eval_weight(q->biases);
-}
-
-/* Apply: y = x @ W.T  -- for both dense (pre-transposed) and quantized variants. */
-static mlx_array qlinear_apply(const QLinear* q, mlx_array x, const Config* c, mlx_stream s) {
-  mlx_array r = mlx_array_new();
-  if (c->quantized) {
-    mlx_optional_int gs = { .value = c->q_group_size, .has_value = true };
-    mlx_optional_int bb = { .value = c->q_bits,       .has_value = true };
-    CHECK(mlx_quantized_matmul(&r, x, q->w, q->scales, q->biases,
-                               /*transpose=*/true, gs, bb, "affine", s));
-  } else {
-    CHECK(mlx_matmul(&r, x, q->w, s));
-  }
-  mlx_array_free(x);
-  return r;
-}
-
-static void load_weights(Weights* W, Config* c, const char* path, mlx_stream s) {
-  mlx_map_string_to_array data = mlx_map_string_to_array_new();
-  mlx_map_string_to_string meta = mlx_map_string_to_string_new();
-  CHECK(mlx_load_safetensors(&data, &meta, path, s));
-
-  /* Auto-detect quantization: scales for layer 0 q_proj => quantized model. */
-  {
-    mlx_array probe = mlx_array_new();
-    int rc = mlx_map_string_to_array_get(&probe, data,
-              "model.layers.0.self_attn.q_proj.scales");
-    mlx_array_free(probe);
-    if (rc == 0) {
-      c->quantized = true;
-      if (c->q_bits == 0)       c->q_bits = 4;
-      if (c->q_group_size == 0) c->q_group_size = 64;
-      fprintf(stderr, "[smlx] quantized model: bits=%d group_size=%d\n",
-              c->q_bits, c->q_group_size);
-    }
-  }
-
-  /* Embedding: dequantize to dense for fast take-based lookup. */
-  if (c->quantized) {
-    mlx_array ew = take_weight(data, "model.embed_tokens.weight", true);
-    mlx_array es = take_weight(data, "model.embed_tokens.scales", true);
-    mlx_array eb = take_weight(data, "model.embed_tokens.biases", true);
-    mlx_array deq = mlx_array_new();
-    mlx_optional_int gs = { .value = c->q_group_size, .has_value = true };
-    mlx_optional_int bb = { .value = c->q_bits,       .has_value = true };
-    mlx_optional_dtype dt = { .has_value = false };
-    mlx_array null_arr = { 0 };
-    CHECK(mlx_dequantize(&deq, ew, es, eb, gs, bb, "affine", null_arr, dt, s));
-    mlx_array_free(ew); mlx_array_free(es); mlx_array_free(eb);
-    W->tok_embed = deq;
-  } else {
-    W->tok_embed = take_weight(data, "model.embed_tokens.weight", true);
-  }
-  W->norm = take_weight(data, "model.norm.weight", true);
-
-  /* LM head: prefer explicit lm_head if present, else tied embeddings. */
-  {
-    mlx_array probe = mlx_array_new();
-    if (mlx_map_string_to_array_get(&probe, data, "lm_head.weight") == 0) {
-      /* Untied. Re-use load_qlinear with synthetic base. */
-      mlx_array_free(probe);
-      load_qlinear(&W->lm_head, data, "lm_head", c, s);
-    } else {
-      mlx_array_free(probe);
-      /* Tied. */
-      if (c->quantized) {
-        /* Re-load the quantized embedding triple as the lm_head linear; we still
-         * have the dense `tok_embed` for embedding lookup. */
-        W->lm_head.w      = take_weight(data, "model.embed_tokens.weight", false);
-        W->lm_head.scales = take_weight(data, "model.embed_tokens.scales", false);
-        W->lm_head.biases = take_weight(data, "model.embed_tokens.biases", false);
-        /* If they were already taken (above) the map returns nothing; in that case
-         * just re-dequantize. We avoided that by re-reading from the freshly
-         * loaded map: `take_weight` errored only on `required=true`. Here, if
-         * weight is missing we synthesize from dense tok_embed via transpose. */
-        if (!W->lm_head.w.ctx) {
-          fprintf(stderr, "[smlx] tied lm_head but no embed triple; bug?\n");
-          exit(1);
-        }
-      } else {
-        mlx_array tied = mlx_array_new();
-        CHECK(mlx_transpose(&tied, W->tok_embed, s));
-        W->lm_head.w = tied;
-        W->lm_head.scales = mlx_array_new();
-        W->lm_head.biases = mlx_array_new();
-      }
-    }
-  }
-
-  W->layers = calloc(c->n_layers, sizeof(LayerW));
-  char base[160];
-  for (int i = 0; i < c->n_layers; i++) {
-    LayerW* L = &W->layers[i];
-    char key[160];
-    snprintf(key, sizeof(key), "model.layers.%d.input_layernorm.weight", i);
-    L->attn_norm = take_weight(data, key, true);
-    snprintf(key, sizeof(key), "model.layers.%d.post_attention_layernorm.weight", i);
-    L->ffn_norm = take_weight(data, key, true);
-    #define LOADQ(field, suffix) \
-      snprintf(base, sizeof(base), "model.layers.%d." suffix, i); \
-      load_qlinear(&L->field, data, base, c, s)
-    LOADQ(wq,     "self_attn.q_proj");
-    LOADQ(wk,     "self_attn.k_proj");
-    LOADQ(wv,     "self_attn.v_proj");
-    LOADQ(wo,     "self_attn.o_proj");
-    LOADQ(w_gate, "mlp.gate_proj");
-    LOADQ(w_up,   "mlp.up_proj");
-    LOADQ(w_down, "mlp.down_proj");
-    #undef LOADQ
-  }
-
-  mlx_map_string_to_array_free(data);
-  mlx_map_string_to_string_free(meta);
-
-  /* Force materialization so subsequent GPU ops don't try to eval `Load` on GPU. */
-  eval_weight(W->tok_embed);
-  eval_weight(W->norm);
-  eval_qlinear(&W->lm_head);
-  for (int i = 0; i < c->n_layers; i++) {
-    LayerW* L = &W->layers[i];
-    eval_weight(L->attn_norm); eval_weight(L->ffn_norm);
-    eval_qlinear(&L->wq); eval_qlinear(&L->wk);
-    eval_qlinear(&L->wv); eval_qlinear(&L->wo);
-    eval_qlinear(&L->w_gate); eval_qlinear(&L->w_up); eval_qlinear(&L->w_down);
-  }
-}
-
-static void free_weights(Weights* W, const Config* c) {
-  for (int i = 0; i < c->n_layers; i++) {
-    LayerW* L = &W->layers[i];
-    mlx_array_free(L->attn_norm); mlx_array_free(L->ffn_norm);
-    free_qlinear(&L->wq); free_qlinear(&L->wk);
-    free_qlinear(&L->wv); free_qlinear(&L->wo);
-    free_qlinear(&L->w_gate); free_qlinear(&L->w_up); free_qlinear(&L->w_down);
-  }
-  free(W->layers);
-  mlx_array_free(W->tok_embed);
-  mlx_array_free(W->norm);
-  free_qlinear(&W->lm_head);
-  mlx_array_free(W->rope_freqs);
-  free(W->rope_freqs_buf);
-}
-
-/* ---------- small op helpers ---------- */
-
-static mlx_array reshape(mlx_array x, const int* shape, int n, mlx_stream s) {
-  mlx_array r = mlx_array_new();
-  CHECK(mlx_reshape(&r, x, shape, (size_t)n, s));
-  mlx_array_free(x);
-  return r;
-}
-
-static mlx_array transpose_axes(mlx_array x, const int* axes, int n, mlx_stream s) {
-  mlx_array r = mlx_array_new();
-  CHECK(mlx_transpose_axes(&r, x, axes, (size_t)n, s));
-  mlx_array_free(x);
-  return r;
-}
-
-static mlx_array matmul(mlx_array a, mlx_array b, mlx_stream s) {
-  mlx_array r = mlx_array_new();
-  CHECK(mlx_matmul(&r, a, b, s));
-  mlx_array_free(a);
-  return r;
-}
-
-static mlx_array add(mlx_array a, mlx_array b, mlx_stream s) {
-  mlx_array r = mlx_array_new();
-  CHECK(mlx_add(&r, a, b, s));
-  mlx_array_free(a); mlx_array_free(b);
-  return r;
-}
-
-static mlx_array mul(mlx_array a, mlx_array b, mlx_stream s) {
-  mlx_array r = mlx_array_new();
-  CHECK(mlx_multiply(&r, a, b, s));
-  mlx_array_free(a); mlx_array_free(b);
-  return r;
-}
-
-static mlx_array sigmoid(mlx_array a, mlx_stream s) {
-  mlx_array r = mlx_array_new();
-  CHECK(mlx_sigmoid(&r, a, s));
-  mlx_array_free(a);
-  return r;
-}
-
-static mlx_array rms_norm(mlx_array x, mlx_array w, float eps, mlx_stream s) {
-  mlx_array r = mlx_array_new();
-  CHECK(mlx_fast_rms_norm(&r, x, w, eps, s));
-  mlx_array_free(x);
-  return r;
-}
-
-static mlx_array rope(mlx_array x, int dims, float base, int offset,
-                      mlx_array freqs, bool use_freqs, mlx_stream s) {
-  mlx_array r = mlx_array_new();
-  mlx_optional_float b = {
-    .value = use_freqs ? 0.0f : base,
-    .has_value = !use_freqs,
-  };
-  mlx_array f = use_freqs ? freqs : (mlx_array){ 0 };
-  CHECK(mlx_fast_rope(&r, x, dims, /*traditional=*/false, b, 1.0f, offset, f, s));
-  mlx_array_free(x);
-  return r;
-}
-
-static mlx_array sdpa(mlx_array q, mlx_array k, mlx_array v, float scale,
-                      const char* mask_mode, mlx_stream s) {
-  mlx_array r = mlx_array_new();
-  mlx_array null_arr = { 0 };
-  CHECK(mlx_fast_scaled_dot_product_attention(
-      &r, q, k, v, scale, mask_mode, null_arr, null_arr, s));
-  mlx_array_free(q); mlx_array_free(k); mlx_array_free(v);
-  return r;
-}
-
-static mlx_array concat2(mlx_array a, mlx_array b, int axis, mlx_stream s) {
-  mlx_array arrs[2] = { a, b };
-  mlx_vector_array v = mlx_vector_array_new_data(arrs, 2);
-  mlx_array r = mlx_array_new();
-  CHECK(mlx_concatenate_axis(&r, v, axis, s));
-  mlx_vector_array_free(v);
-  mlx_array_free(a); mlx_array_free(b);
-  return r;
-}
-
-static mlx_array take_axis0(mlx_array a, mlx_array idx, mlx_stream s) {
-  mlx_array r = mlx_array_new();
-  CHECK(mlx_take_axis(&r, a, idx, 0, s));
-  return r;
-}
-
-/* Last position along axis=1: x[:, -1:, :]. */
-static mlx_array last_token(mlx_array x, int seq_len, mlx_stream s) {
-  size_t nd = mlx_array_ndim(x);
-  const int* shape = mlx_array_shape(x);
-  int start[8], stop[8], stride[8];
-  for (size_t i = 0; i < nd; i++) { start[i] = 0; stop[i] = shape[i]; stride[i] = 1; }
-  start[1] = seq_len - 1;
-  stop[1] = seq_len;
-  mlx_array r = mlx_array_new();
-  CHECK(mlx_slice(&r, x, start, nd, stop, nd, stride, nd, s));
-  mlx_array_free(x);
-  return r;
-}
-
-/* ---------- sampling ---------- */
-
-typedef struct {
-  float    temperature;  /* 0 = greedy/argmax (top_k/top_p ignored) */
-  int      top_k;        /* 0 = disabled */
-  float    top_p;        /* >=1.0 = disabled */
-  uint64_t seed;         /* base seed; per-step key = seed + step */
-} Sampling;
-
-/* Argmax over [1, 1, vocab] -> uint32 id. Forces eval. */
-static uint32_t argmax_id(mlx_array logits, mlx_stream s) {
-  mlx_array idx = mlx_array_new();
-  CHECK(mlx_argmax_axis(&idx, logits, -1, false, s));
-  mlx_array_free(logits);
-  int sh[1] = {1};
-  mlx_array flat = mlx_array_new();
-  CHECK(mlx_reshape(&flat, idx, sh, 1, s));
-  mlx_array_free(idx);
-  CHECK(mlx_array_eval(flat));
-  uint32_t out;
-  CHECK(mlx_array_item_uint32(&out, flat));
-  mlx_array_free(flat);
-  return out;
-}
-
-/* Sample one id from logits[1,1,vocab]. Consumes logits. */
-static uint32_t sample_id(mlx_array logits, const Config* cfg, const Sampling* p,
-                          uint64_t step_seed, mlx_stream s) {
-  if (p->temperature == 0.0f) return argmax_id(logits, s);
-
-  /* temperature scale */
-  mlx_array t = mlx_array_new_float(p->temperature);
-  mlx_array sc = mlx_array_new();
-  CHECK(mlx_divide(&sc, logits, t, s));
-  mlx_array_free(t); mlx_array_free(logits);
-  logits = sc;
-
-  const int V = cfg->vocab_size;
-
-  /* top-k: keep only the K largest; threshold = K-th largest value. */
-  if (p->top_k > 0 && p->top_k < V) {
-    /* mlx_partition_axis places the (kth)-smallest in slot kth. We want the
-     * (V - top_k)-th smallest = top_k-th largest. */
-    mlx_array part = mlx_array_new();
-    CHECK(mlx_partition_axis(&part, logits, V - p->top_k, -1, s));
-    int start[3]  = {0, 0, V - p->top_k};
-    int stop[3]   = {1, 1, V - p->top_k + 1};
-    int stride[3] = {1, 1, 1};
-    mlx_array thr = mlx_array_new();
-    CHECK(mlx_slice(&thr, part, start, 3, stop, 3, stride, 3, s));
-    mlx_array_free(part);
-
-    mlx_array mask = mlx_array_new();
-    CHECK(mlx_less(&mask, logits, thr, s));
-    mlx_array_free(thr);
-
-    mlx_array neg_inf = mlx_array_new_float(-INFINITY);
-    mlx_array gated = mlx_array_new();
-    CHECK(mlx_where(&gated, mask, neg_inf, logits, s));
-    mlx_array_free(mask); mlx_array_free(neg_inf); mlx_array_free(logits);
-    logits = gated;
-  }
-
-  /* top-p (nucleus): keep smallest set whose cumulative prob exceeds p, in sorted order. */
-  if (p->top_p < 1.0f && p->top_p > 0.0f) {
-    /* descending sort via argsort(-logits) */
-    mlx_array neg = mlx_array_new();   CHECK(mlx_negative(&neg, logits, s));
-    mlx_array idx = mlx_array_new();   CHECK(mlx_argsort_axis(&idx, neg, -1, s));
-    mlx_array_free(neg);
-
-    mlx_array sorted = mlx_array_new();
-    CHECK(mlx_take_along_axis(&sorted, logits, idx, -1, s));
-
-    mlx_array probs = mlx_array_new();
-    CHECK(mlx_softmax_axis(&probs, sorted, -1, /*precise=*/false, s));
-    /* Exclusive cumsum so position 0 (the top token) is always included. */
-    mlx_array cs = mlx_array_new();
-    CHECK(mlx_cumsum(&cs, probs, -1, /*reverse=*/false, /*inclusive=*/false, s));
-    mlx_array_free(probs);
-
-    mlx_array thr = mlx_array_new_float(p->top_p);
-    mlx_array mask = mlx_array_new();
-    CHECK(mlx_less(&mask, cs, thr, s));
-    mlx_array_free(cs); mlx_array_free(thr);
-
-    mlx_array neg_inf = mlx_array_new_float(-INFINITY);
-    mlx_array filt_sorted = mlx_array_new();
-    CHECK(mlx_where(&filt_sorted, mask, sorted, neg_inf, s));
-    mlx_array_free(mask); mlx_array_free(neg_inf); mlx_array_free(sorted);
-
-    /* Scatter back to original positions: inv = argsort(idx). */
-    mlx_array inv = mlx_array_new();
-    CHECK(mlx_argsort_axis(&inv, idx, -1, s));
-    mlx_array_free(idx);
-
-    mlx_array unsorted = mlx_array_new();
-    CHECK(mlx_take_along_axis(&unsorted, filt_sorted, inv, -1, s));
-    mlx_array_free(filt_sorted); mlx_array_free(inv);
-    mlx_array_free(logits);
-    logits = unsorted;
-  }
-
-  /* sample */
-  mlx_array key = mlx_array_new();
-  CHECK(mlx_random_key(&key, step_seed));
-  mlx_array sampled = mlx_array_new();
-  CHECK(mlx_random_categorical(&sampled, logits, -1, key, s));
-  mlx_array_free(logits); mlx_array_free(key);
-
-  /* sampled has shape [1, 1] int32. */
-  int sh[1] = {1};
-  mlx_array flat = mlx_array_new();
-  CHECK(mlx_reshape(&flat, sampled, sh, 1, s));
-  mlx_array_free(sampled);
-  CHECK(mlx_array_eval(flat));
-  /* categorical returns int32, not uint32. */
-  int32_t out_i;
-  CHECK(mlx_array_item_int32(&out_i, flat));
-  mlx_array_free(flat);
-  return (uint32_t)out_i;
-}
-
-/* ---------- forward ---------- */
-
-typedef struct {
-  mlx_array* keys;    /* per-layer cached keys,   shape [1, n_kv_heads, T_past, head_dim] */
-  mlx_array* values;  /* per-layer cached values */
-  bool* primed;
-  int offset;         /* number of past tokens */
-} KVCache;
-
-static KVCache cache_new(int n_layers) {
-  KVCache c;
-  c.keys = calloc(n_layers, sizeof(mlx_array));
-  c.values = calloc(n_layers, sizeof(mlx_array));
-  c.primed = calloc(n_layers, sizeof(bool));
-  c.offset = 0;
-  return c;
-}
-
-static void cache_free(KVCache* c, int n_layers) {
-  for (int i = 0; i < n_layers; i++) {
-    if (c->primed[i]) { mlx_array_free(c->keys[i]); mlx_array_free(c->values[i]); }
-  }
-  free(c->keys); free(c->values); free(c->primed);
-}
-
-/* Run forward on tokens [B=1, T] -> sampled token id (uint32). */
-static uint32_t forward(const Config* cfg, Weights* W, KVCache* kv,
-                        const int32_t* tok_ids, int T,
-                        const Sampling* samp, mlx_stream s) {
-  /* Build token id array [1, T] -> embed -> [1, T, dim] */
-  int tok_shape[2] = {1, T};
-  mlx_array tokens = mlx_array_new_data(tok_ids, tok_shape, 2, MLX_INT32);
-
-  /* Embedding via take(axis=0). Need to reshape to [T] for axis-0 take, then reshape back. */
-  int t_shape[1] = {T};
-  mlx_array tokens_flat = mlx_array_new();
-  CHECK(mlx_reshape(&tokens_flat, tokens, t_shape, 1, s));
-  mlx_array_free(tokens);
-
-  mlx_array x = take_axis0(W->tok_embed, tokens_flat, s);  /* [T, dim] */
-  mlx_array_free(tokens_flat);
-  int xshape[3] = {1, T, cfg->dim};
-  x = reshape(x, xshape, 3, s);  /* [1, T, dim] */
-
-  const int n_h   = cfg->n_heads;
-  const int n_kvh = cfg->n_kv_heads;
-  const int d_h   = cfg->head_dim;
-  const float scale = 1.0f / sqrtf((float)d_h);
-  const int qkv_perm[4] = {0, 2, 1, 3};
-
-  for (int i = 0; i < cfg->n_layers; i++) {
-    LayerW* L = &W->layers[i];
-
-    /* --- attention --- */
-    mlx_array h = mlx_array_new();
-    CHECK(mlx_fast_rms_norm(&h, x, L->attn_norm, cfg->norm_eps, s));
-
-    /* Project Q/K/V. qlinear_apply consumes its input `x`, so reuse h once and
-     * for the other two start from a fresh handle pointing at the same data. */
-    mlx_array h2 = mlx_array_new(); CHECK(mlx_array_set(&h2, h));
-    mlx_array h3 = mlx_array_new(); CHECK(mlx_array_set(&h3, h));
-    mlx_array q = qlinear_apply(&L->wq, h,  cfg, s);
-    mlx_array k = qlinear_apply(&L->wk, h2, cfg, s);
-    mlx_array v = qlinear_apply(&L->wv, h3, cfg, s);
-
-    int q_shape[4] = {1, T, n_h,   d_h};
-    int k_shape[4] = {1, T, n_kvh, d_h};
-    q = reshape(q, q_shape, 4, s);
-    k = reshape(k, k_shape, 4, s);
-    v = reshape(v, k_shape, 4, s);
-
-    /* [B, T, H, D] -> [B, H, T, D] */
-    q = transpose_axes(q, qkv_perm, 4, s);
-    k = transpose_axes(k, qkv_perm, 4, s);
-    v = transpose_axes(v, qkv_perm, 4, s);
-
-    /* RoPE on Q and K (in place of position embedding). */
-    q = rope(q, d_h, cfg->rope_theta, kv->offset, W->rope_freqs, W->use_rope_freqs, s);
-    k = rope(k, d_h, cfg->rope_theta, kv->offset, W->rope_freqs, W->use_rope_freqs, s);
-
-    /* Append to cache. */
-    if (kv->primed[i]) {
-      k = concat2(kv->keys[i], k, 2, s);
-      v = concat2(kv->values[i], v, 2, s);
-    }
-    /* mlx arrays are reference-counted; we make new handles to hold in the cache. */
-    kv->keys[i] = mlx_array_new();
-    kv->values[i] = mlx_array_new();
-    CHECK(mlx_array_set(&kv->keys[i], k));
-    CHECK(mlx_array_set(&kv->values[i], v));
-    kv->primed[i] = true;
-
-    const char* mask = (T > 1) ? "causal" : "";
-    mlx_array attn = sdpa(q, k, v, scale, mask, s);  /* [1, n_h, T, d_h] */
-
-    int back_perm[4] = {0, 2, 1, 3};
-    attn = transpose_axes(attn, back_perm, 4, s);    /* [1, T, n_h, d_h] */
-    int merged[3] = {1, T, n_h * d_h};
-    attn = reshape(attn, merged, 3, s);
-
-    mlx_array attn_out = qlinear_apply(&L->wo, attn, cfg, s);
-    x = add(x, attn_out, s);
-
-    /* --- mlp (SwiGLU) --- */
-    mlx_array hn = mlx_array_new();
-    CHECK(mlx_fast_rms_norm(&hn, x, L->ffn_norm, cfg->norm_eps, s));
-    mlx_array hn2 = mlx_array_new(); CHECK(mlx_array_set(&hn2, hn));
-    mlx_array g = qlinear_apply(&L->w_gate, hn,  cfg, s);
-    mlx_array u = qlinear_apply(&L->w_up,   hn2, cfg, s);
-
-    /* silu(g) = g * sigmoid(g) */
-    mlx_array g_sig = mlx_array_new();
-    CHECK(mlx_sigmoid(&g_sig, g, s));
-    mlx_array silu_g = mul(g, g_sig, s);
-    mlx_array gated = mul(silu_g, u, s);
-
-    mlx_array mlp_out = qlinear_apply(&L->w_down, gated, cfg, s);
-    x = add(x, mlp_out, s);
-  }
-
-  /* Final norm + lm head on last position only. */
-  mlx_array xn = mlx_array_new();
-  CHECK(mlx_fast_rms_norm(&xn, x, W->norm, cfg->norm_eps, s));
-  mlx_array_free(x);
-
-  xn = last_token(xn, T, s);  /* [1, 1, dim] */
-  mlx_array logits = qlinear_apply(&W->lm_head, xn, cfg, s);  /* [1, 1, vocab] */
-
-  uint32_t out = sample_id(logits, cfg, samp, samp->seed + (uint64_t)kv->offset, s);
-  kv->offset += T;
-  return out;
-}
-
-/* ---------- main ---------- */
 
 static void usage(void) {
   fprintf(stderr,
@@ -734,7 +35,6 @@ static void usage(void) {
   exit(2);
 }
 
-/* Read whitespace-separated integers from a stream into a freshly-allocated array. */
 static int32_t* read_ids_stream(FILE* f, int* n_out) {
   size_t cap = 64, n = 0;
   int32_t* buf = malloc(sizeof(int32_t) * cap);
@@ -764,58 +64,62 @@ int main(int argc, char** argv) {
     if (n_prompt == 0) { fprintf(stderr, "no prompt ids on stdin\n"); return 2; }
   }
 
-  Config cfg; parse_config(cfg_path, &cfg);
-  if (cfg.n_layers <= 0 || cfg.dim <= 0) {
-    fprintf(stderr, "config missing required fields\n"); return 1;
-  }
+  smlx_config cfg;
+  if (smlx_config_load(&cfg, cfg_path) != 0) return 1;
 
-  mlx_stream cpu = mlx_default_cpu_stream_new();
-  mlx_stream s   = mlx_default_gpu_stream_new();
-  Weights W;
-  load_weights(&W, &cfg, w_path, cpu);
-  build_rope_freqs(&W, &cfg);
-  mlx_stream_free(cpu);
+  smlx_model* model = smlx_model_load(&cfg, w_path);
+  smlx_session* sess = smlx_session_new(model);
 
-  KVCache kv = cache_new(cfg.n_layers);
-
-  /* Sampling params via env (so the chat wrapper can set them per-call without
-   * cluttering the positional CLI). */
-  Sampling samp = {0};
+  smlx_sampling samp = {0};
   const char* e;
-  if ((e = getenv("SMLX_TEMP")))   samp.temperature = (float)atof(e);
-  if ((e = getenv("SMLX_TOP_K")))  samp.top_k       = atoi(e);
-  if ((e = getenv("SMLX_TOP_P")))  samp.top_p       = (float)atof(e);
-  else                             samp.top_p       = 1.0f;
-  if ((e = getenv("SMLX_SEED")))   samp.seed        = (uint64_t)strtoull(e, NULL, 10);
+  if ((e = getenv("SMLX_TEMP")))  samp.temperature = (float)atof(e);
+  if ((e = getenv("SMLX_TOP_K"))) samp.top_k       = atoi(e);
+  if ((e = getenv("SMLX_TOP_P"))) samp.top_p       = (float)atof(e);
+  else                            samp.top_p       = 1.0f;
+  if ((e = getenv("SMLX_SEED")))  samp.seed        = (uint64_t)strtoull(e, NULL, 10);
 
-  /* Prefill on the whole prompt. */
+  int eos[16]; int n_eos = 0;
+  if ((e = getenv("SMLX_EOS"))) {
+    char* dup = strdup(e);
+    for (char* tok = strtok(dup, ","); tok && n_eos < 16; tok = strtok(NULL, ",")) {
+      eos[n_eos++] = atoi(tok);
+    }
+    free(dup);
+  }
+  #define IS_EOS(id) ({ bool _r = false; \
+    for (int _i = 0; _i < n_eos; _i++) if ((int)(id) == eos[_i]) { _r = true; break; } \
+    _r; })
+
   double t0 = now_s();
-  uint32_t next = forward(&cfg, &W, &kv, prompt, n_prompt, &samp, s);
+  uint32_t next = smlx_generate(sess, prompt, n_prompt, &samp);
   double t1 = now_s();
-  printf("%u", next);
+  printf("%u\n", next);
+  fflush(stdout);
 
-  /* Decode loop. */
-  for (int i = 1; i < max_new; i++) {
-    int32_t one = (int32_t)next;
-    next = forward(&cfg, &W, &kv, &one, 1, &samp, s);
-    printf(" %u", next);
-    fflush(stdout);
+  int decoded = 1;
+  if (!IS_EOS(next)) {
+    for (int i = 1; i < max_new; i++) {
+      int32_t one = (int32_t)next;
+      next = smlx_generate(sess, &one, 1, &samp);
+      printf("%u\n", next);
+      fflush(stdout);
+      decoded++;
+      if (IS_EOS(next)) break;
+    }
   }
   double t2 = now_s();
-  printf("\n");
 
-  double prefill_s = t1 - t0;
-  double decode_s  = t2 - t1;
-  int decoded = max_new - 1;
+  double prefill_s = t1 - t0, decode_s = t2 - t1;
+  int dec_after = decoded - 1;
   fprintf(stderr,
     "[smlx] prefill: %d tok in %.3fs = %.1f tok/s | "
     "decode: %d tok in %.3fs = %.1f tok/s\n",
     n_prompt, prefill_s, prefill_s > 0 ? n_prompt / prefill_s : 0.0,
-    decoded,  decode_s,  decode_s  > 0 ? decoded  / decode_s  : 0.0);
+    dec_after, decode_s,
+    decode_s > 0 && dec_after > 0 ? dec_after / decode_s : 0.0);
 
-  cache_free(&kv, cfg.n_layers);
-  free_weights(&W, &cfg);
-  mlx_stream_free(s);
+  smlx_session_free(sess);
+  smlx_model_free(model);
   free(prompt);
   return 0;
 }

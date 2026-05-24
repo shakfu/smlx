@@ -68,23 +68,35 @@ def main():
         "SMLX_TOP_K": str(args.top_k),
         "SMLX_TOP_P": str(args.top_p),
         "SMLX_SEED":  str(args.seed),
+        "SMLX_EOS":   ",".join(str(i) for i in EOT_IDS_LLAMA3),
     }
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         [args.bin, cfg, weights, str(args.max)],
-        input=" ".join(str(i) for i in ids),
-        capture_output=True,
-        text=True,
-        check=True,
-        env=env,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr,
+        text=True, env=env, bufsize=1,
     )
-    out_ids = [int(x) for x in proc.stdout.split()]
+    proc.stdin.write(" ".join(str(i) for i in ids))
+    proc.stdin.close()
 
-    # Truncate at first eot / eos.
-    cut = next((i for i, t in enumerate(out_ids) if t in EOT_IDS_LLAMA3), len(out_ids))
-    out_ids = out_ids[:cut]
-
-    text = tok.decode(out_ids)
-    print(text)
+    # Stream tokens: decode incrementally and print the delta. BPE tokens can
+    # span UTF-8 boundaries, so we decode the cumulative buffer each step and
+    # emit only the new suffix.
+    out_ids = []
+    last_text = ""
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        tid = int(line)
+        if tid in EOT_IDS_LLAMA3:
+            break
+        out_ids.append(tid)
+        cur = tok.decode(out_ids)
+        sys.stdout.write(cur[len(last_text):])
+        sys.stdout.flush()
+        last_text = cur
+    proc.wait()
+    sys.stdout.write("\n")
 
 
 if __name__ == "__main__":

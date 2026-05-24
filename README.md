@@ -51,9 +51,13 @@ Set via env vars (the chat wrapper forwards `--temp/--top-k/--top-p/--seed`):
 
 ## Layout
 
-- `src/main.c` — the whole runtime (loader, forward, sampler, generate loop)
+- `src/smlx.h`, `src/smlx.c` — **libsmlx** (model load, forward, KV cache, sampler).
+  Public API: `smlx_config_load`, `smlx_model_load/free`, `smlx_session_new/free`,
+  `smlx_generate`. Opaque handles, no mlx-c types in the API.
+- `src/main.c` — thin CLI on top of libsmlx
+- `examples/hello_lib.c` — minimal example linking against libsmlx
 - `thirdparty/mlx-c/` — in-tree mlx-c (built by CMake as a subdirectory)
-- `scripts/chat.py` — tokenizer wrapper
+- `scripts/chat.py` — tokenizer wrapper (streams tokens)
 - `scripts/ref_argmax.py`, `bench*.{sh,py}` — reference + benchmarking
 
 ## Known limits

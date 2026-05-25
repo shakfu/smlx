@@ -1,8 +1,8 @@
 # smlx
 
-Experiments with [mlx-c](https://github.com/ml-explore/mlx-c): a small C
-implementation of Llama / Qwen generate loops, verified bit-exact against
-`mlx_lm.generate`, with a fully self-contained text-chat binary (no Python).
+Experiments with [mlx-c](https://github.com/ml-explore/mlx-c): a small C implementation of Llama / Qwen generate loops, verified bit-exact against `mlx_lm.generate`, with a fully self-contained text-chat binary (no Python).
+
+It produces `smlx`, a 26MB (unstripped), 21MB (stripped), executable which uses mlx-c and a builtin tokenizer to chat/prompt Llama 3.x to Qwen2/3 mlx models.
 
 ## Status
 
@@ -22,6 +22,16 @@ the reference there without indicating a bug.)
 
 ## Build
 
+The vendored dependencies under `thirdparty/` are **not** committed — fetch
+them first (one time):
+
+```sh
+./scripts/fetch-thirdparty.sh    # clones mlx-c + tokenizers-cpp, vendors minja + nlohmann
+```
+
+This needs `git`, `curl`, and a **Rust toolchain** (`cargo`) — tokenizers-cpp
+compiles a Rust crate. Then build:
+
 ```sh
 make            # configure (first run) + build everything
 ```
@@ -37,6 +47,45 @@ Convenience targets: `make repl`, `make chat MODEL=... PROMPT=...`,
 `make smoke`, `make test` (bit-exact vs `mlx_lm`), `make bench`, `make clean`,
 `make distclean`, `make help`. The first build compiles mlx + the Rust
 tokenizer crate, so it takes a few minutes; later builds are incremental.
+
+## Adding a model
+
+`models/` is gitignored, so you download models yourself. Any single-shard
+mlx-format checkpoint of a supported architecture works (bf16/fp16 or mlx
+4-bit/8-bit affine quant). For example:
+
+```sh
+pip install huggingface_hub
+huggingface-cli download mlx-community/Qwen3-0.6B-4bit \
+    --local-dir models/Qwen3-0.6B-4bit
+```
+
+Then write a `smlx.config.txt` next to `model.safetensors`, with values read
+off the model's `config.json`:
+
+```
+n_layers=28              # num_hidden_layers
+dim=1024                 # hidden_size
+n_heads=16               # num_attention_heads
+n_kv_heads=8             # num_key_value_heads
+head_dim=128             # head_dim  (NOT always hidden_size/n_heads -- read it)
+hidden_dim=3072          # intermediate_size
+vocab_size=151936        # vocab_size
+rope_theta=1000000.0     # rope_theta
+norm_eps=1e-6            # rms_norm_eps
+rope_original_max_pos=0  # rope_scaling.original_max_position_embeddings, else 0
+q_bits=4                 # quantization.bits        (omit if not quantized)
+q_group_size=64          # quantization.group_size  (omit if not quantized)
+```
+
+Notes:
+- `rope_original_max_pos=0` disables RoPE scaling. Set it (plus `rope_factor`,
+  `rope_low_freq_factor`, `rope_high_freq_factor`) only when `config.json` has
+  a `rope_scaling` block of type `llama3` (Llama 3.x).
+- Architecture variants (QKV bias for Qwen 2.x, QK-Norm for Qwen 3) and
+  quantization are auto-detected from the weights — no extra config needed
+  beyond `q_bits`/`q_group_size`.
+- The bundled example models already include a `smlx.config.txt`.
 
 ## Run
 
@@ -95,6 +144,7 @@ derives stop ids automatically from the model's config.
 - `thirdparty/mlx-c/` — in-tree mlx-c (built by CMake as a subdirectory)
 - `thirdparty/tokenizers-cpp/` — HF tokenizer (Rust, statically linked)
 - `thirdparty/minja/`, `thirdparty/nlohmann/` — vendored headers for chat templates
+- `scripts/fetch-thirdparty.sh` — populate `thirdparty/` (pinned deps)
 - `scripts/ref_*.py`, `bench*.{sh,py}`, `test.sh` — reference + benchmarking + correctness
 
 ## Known limits

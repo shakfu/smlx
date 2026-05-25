@@ -78,11 +78,16 @@ int smlx_config_load(smlx_config* c, const char* path) {
 
 /* A linear layer: dense (w pre-transposed, scales/biases empty) or quantized
  * (w = packed uint32 [out, in/pack], scales/biases populated). The forward
- * branches on smlx_config.quantized. */
+ * branches on smlx_config.quantized.
+ *
+ * Note: `biases` (plural) are quantization zero-points, used inside
+ * quantized_matmul. `out_bias` (singular) is a projection bias added AFTER the
+ * matmul (Qwen 2.x Q/K/V projections); empty handle when the layer has none. */
 typedef struct {
   mlx_array w;
   mlx_array scales;
   mlx_array biases;
+  mlx_array out_bias;
 } QLinear;
 
 typedef struct {
@@ -90,6 +95,9 @@ typedef struct {
   mlx_array ffn_norm;
   QLinear   wq, wk, wv, wo;
   QLinear   w_gate, w_up, w_down;
+  /* Qwen3 QK-Norm: per-head RMSNorm weights [head_dim], applied to Q and K
+   * before RoPE. Empty handles when the model has no QK-Norm. */
+  mlx_array q_norm, k_norm;
 } LayerW;
 
 typedef struct {
@@ -173,7 +181,8 @@ static void build_rope_freqs(Weights* W, const smlx_config* c) {
 }
 
 /* Load a linear's weights. For dense: takes `.weight`, transposes to [in,out].
- * For quantized: takes `.weight` (packed uint32), `.scales`, `.biases` as-is. */
+ * For quantized: takes `.weight` (packed uint32), `.scales`, `.biases` as-is.
+ * Always tries to load an optional projection bias `.bias` (Qwen 2.x QKV). */
 static void load_qlinear(QLinear* q, mlx_map_string_to_array data, const char* base,
                          const smlx_config* c, mlx_stream s) {
   char key[160];
@@ -187,19 +196,23 @@ static void load_qlinear(QLinear* q, mlx_map_string_to_array data, const char* b
     q->scales = mlx_array_new();
     q->biases = mlx_array_new();
   }
+  snprintf(key, sizeof(key), "%s.bias", base);
+  q->out_bias = take_weight(data, key, false);  /* empty handle if absent */
 }
 
 static void free_qlinear(QLinear* q) {
-  mlx_array_free(q->w); mlx_array_free(q->scales); mlx_array_free(q->biases);
+  mlx_array_free(q->w); mlx_array_free(q->scales);
+  mlx_array_free(q->biases); mlx_array_free(q->out_bias);
 }
 
 static void eval_qlinear(QLinear* q) {
   eval_weight(q->w);
   if (q->scales.ctx) eval_weight(q->scales);
   if (q->biases.ctx) eval_weight(q->biases);
+  if (q->out_bias.ctx) eval_weight(q->out_bias);
 }
 
-/* Apply: y = x @ W.T  -- for both dense (pre-transposed) and quantized variants. */
+/* Apply: y = x @ W.T (+ out_bias) -- for both dense and quantized variants. */
 static mlx_array qlinear_apply(const QLinear* q, mlx_array x, const smlx_config* c, mlx_stream s) {
   mlx_array r = mlx_array_new();
   if (c->quantized) {
@@ -211,6 +224,12 @@ static mlx_array qlinear_apply(const QLinear* q, mlx_array x, const smlx_config*
     CHECK(mlx_matmul(&r, x, q->w, s));
   }
   mlx_array_free(x);
+  if (q->out_bias.ctx) {
+    mlx_array t = mlx_array_new();
+    CHECK(mlx_add(&t, r, q->out_bias, s));  /* broadcasts [out] over [..., out] */
+    mlx_array_free(r);
+    r = t;
+  }
   return r;
 }
 
@@ -232,6 +251,26 @@ static void load_weights(Weights* W, smlx_config* c, const char* path, mlx_strea
       fprintf(stderr, "[smlx] quantized model: bits=%d group_size=%d\n",
               c->q_bits, c->q_group_size);
     }
+  }
+
+  /* Auto-detect architecture variants on layer 0:
+   *   q_proj.bias  => Qwen 2.x style QKV projection bias
+   *   q_norm.weight => Qwen 3 style QK-Norm */
+  {
+    mlx_array probe = mlx_array_new();
+    if (mlx_map_string_to_array_get(&probe, data,
+          "model.layers.0.self_attn.q_proj.bias") == 0) {
+      c->attn_qkv_bias = true;
+    }
+    mlx_array_free(probe);
+    probe = mlx_array_new();
+    if (mlx_map_string_to_array_get(&probe, data,
+          "model.layers.0.self_attn.q_norm.weight") == 0) {
+      c->qk_norm = true;
+    }
+    mlx_array_free(probe);
+    if (c->attn_qkv_bias) fprintf(stderr, "[smlx] QKV projection bias (Qwen 2.x)\n");
+    if (c->qk_norm)       fprintf(stderr, "[smlx] QK-Norm (Qwen 3)\n");
   }
 
   /* Embedding: dequantize to dense for fast take-based lookup. */
@@ -306,6 +345,15 @@ static void load_weights(Weights* W, smlx_config* c, const char* path, mlx_strea
     LOADQ(w_up,   "mlp.up_proj");
     LOADQ(w_down, "mlp.down_proj");
     #undef LOADQ
+    if (c->qk_norm) {
+      snprintf(key, sizeof(key), "model.layers.%d.self_attn.q_norm.weight", i);
+      L->q_norm = take_weight(data, key, true);
+      snprintf(key, sizeof(key), "model.layers.%d.self_attn.k_norm.weight", i);
+      L->k_norm = take_weight(data, key, true);
+    } else {
+      L->q_norm = mlx_array_new();
+      L->k_norm = mlx_array_new();
+    }
   }
 
   mlx_map_string_to_array_free(data);
@@ -321,6 +369,8 @@ static void load_weights(Weights* W, smlx_config* c, const char* path, mlx_strea
     eval_qlinear(&L->wq); eval_qlinear(&L->wk);
     eval_qlinear(&L->wv); eval_qlinear(&L->wo);
     eval_qlinear(&L->w_gate); eval_qlinear(&L->w_up); eval_qlinear(&L->w_down);
+    if (L->q_norm.ctx) eval_weight(L->q_norm);
+    if (L->k_norm.ctx) eval_weight(L->k_norm);
   }
 }
 
@@ -331,6 +381,7 @@ static void free_weights(Weights* W, const smlx_config* c) {
     free_qlinear(&L->wq); free_qlinear(&L->wk);
     free_qlinear(&L->wv); free_qlinear(&L->wo);
     free_qlinear(&L->w_gate); free_qlinear(&L->w_up); free_qlinear(&L->w_down);
+    mlx_array_free(L->q_norm); mlx_array_free(L->k_norm);
   }
   free(W->layers);
   mlx_array_free(W->tok_embed);
@@ -701,6 +752,17 @@ static uint32_t forward(const smlx_config* cfg, Weights* W, KVCache* kv,
     q = reshape(q, q_shape, 4, s);
     k = reshape(k, k_shape, 4, s);
     v = reshape(v, k_shape, 4, s);
+
+    /* Qwen3 QK-Norm: per-head RMSNorm over the head_dim axis, on [B,T,H,D]
+     * (last axis = head_dim), applied before the transpose and RoPE. */
+    if (cfg->qk_norm) {
+      mlx_array qn = mlx_array_new();
+      CHECK(mlx_fast_rms_norm(&qn, q, L->q_norm, cfg->norm_eps, s));
+      mlx_array_free(q); q = qn;
+      mlx_array kn = mlx_array_new();
+      CHECK(mlx_fast_rms_norm(&kn, k, L->k_norm, cfg->norm_eps, s));
+      mlx_array_free(k); k = kn;
+    }
 
     /* [B, T, H, D] -> [B, H, T, D] */
     q = transpose_axes(q, qkv_perm, 4, s);

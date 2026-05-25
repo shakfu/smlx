@@ -35,6 +35,11 @@ typedef struct smlx_config {
   bool  quantized;
   int   q_bits;
   int   q_group_size;
+  /* Architecture variants, auto-detected at load:
+   *   attn_qkv_bias -- Q/K/V projections have a bias (Qwen 2.x)
+   *   qk_norm       -- per-head RMSNorm on Q and K before RoPE (Qwen 3) */
+  bool  attn_qkv_bias;
+  bool  qk_norm;
 } smlx_config;
 
 typedef struct smlx_sampling {

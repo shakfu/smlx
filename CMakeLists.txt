@@ -13,10 +13,6 @@ target_include_directories(smlx_core PUBLIC src thirdparty/mlx-c)
 target_link_libraries(smlx_core PUBLIC mlxc)
 set_target_properties(smlx_core PROPERTIES OUTPUT_NAME smlx)
 
-# CLI binary.
-add_executable(smlx src/main.c)
-target_link_libraries(smlx PRIVATE smlx_core)
-
 # Tiny example showing how to link against libsmlx without the CLI.
 add_executable(hello_lib examples/hello_lib.c)
 target_link_libraries(hello_lib PRIVATE smlx_core)
@@ -26,12 +22,11 @@ add_executable(run_exported examples/run_exported.c)
 target_include_directories(run_exported PRIVATE thirdparty/mlx-c)
 target_link_libraries(run_exported PRIVATE mlxc)
 
-# Fully self-contained text chat: tokenizers-cpp (text<->ids) + minja
-# (chat template) + libsmlx. No Python at runtime.
-# We only use the HF tokenizer.json path, so disable the SentencePiece build.
+# Unified CLI: `smlx chat` (tokenizers-cpp + minja, no Python) and `smlx gen`
+# (raw token ids). We only use the HF tokenizer.json path, so skip SentencePiece.
 set(MLC_ENABLE_SENTENCEPIECE_TOKENIZER OFF CACHE BOOL "" FORCE)
 add_subdirectory(thirdparty/tokenizers-cpp)
 
-add_executable(smlx_chat src/chat_main.cpp)
-target_include_directories(smlx_chat PRIVATE thirdparty)  # minja/, nlohmann/
-target_link_libraries(smlx_chat PRIVATE smlx_core tokenizers_cpp)
+add_executable(smlx src/main.cpp)
+target_include_directories(smlx PRIVATE thirdparty)  # minja/, nlohmann/
+target_link_libraries(smlx PRIVATE smlx_core tokenizers_cpp)

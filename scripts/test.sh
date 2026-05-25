@@ -41,7 +41,7 @@ print(' '.join(map(str, t.encode('$PROMPT_TEXT', add_special_tokens=False))))
 " 2>/dev/null)
   if [ -z "$ids" ]; then echo "FAIL $m (tokenize failed)"; fail=1; continue; fi
 
-  smlx=$(echo "$ids" | "$BIN" "$d/smlx.config.txt" "$d/model.safetensors" "$N" 2>/dev/null \
+  smlx=$(echo "$ids" | "$BIN" ids "$d/smlx.config.txt" "$d/model.safetensors" "$N" 2>/dev/null \
          | tr '\n' ' ' | xargs)
   ref=$("$PY" scripts/ref_qwen.py "$d" "$N" $ids 2>/dev/null | xargs)
 

@@ -27,7 +27,7 @@ echo "prompt tokens: $N_PROMPT  | max_new: $MAX_NEW"
 echo
 
 echo "=== smlx (C / mlx-c, greedy) ==="
-echo "$IDS" | ./build/smlx "$MODEL/smlx.config.txt" "$MODEL/model.safetensors" "$MAX_NEW" \
+echo "$IDS" | ./build/smlx ids "$MODEL/smlx.config.txt" "$MODEL/model.safetensors" "$MAX_NEW" \
   > /tmp/smlx_out.txt 2> /tmp/smlx_err.txt
 grep '\[smlx\]' /tmp/smlx_err.txt
 echo

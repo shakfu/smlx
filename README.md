@@ -12,7 +12,7 @@ implementation of Llama / Qwen generate loops, verified bit-exact against
 - KV-cached prefill + token-by-token decode (preallocated slots).
 - Llama-3 RoPE scaling (the non-uniform per-dim rescaling from `config.json`).
 - Sampling: greedy / temperature / top-k / top-p / seeded RNG.
-- Self-contained text chat (`smlx_chat`): tokenizer + chat template compiled
+- Self-contained text chat (`smlx chat`): tokenizer + chat template compiled
   in, single-shot and interactive modes, token-by-token streaming. No Python.
 
 All of the above verified **bit-exact** against `mlx_lm.generate` on a real
@@ -40,56 +40,58 @@ tokenizer crate, so it takes a few minutes; later builds are incremental.
 
 ## Run
 
-`smlx_chat` is the self-contained text CLI — **no Python**. The tokenizer
-(tokenizers-cpp) and chat-template renderer (minja) are compiled in; it uses
-each model's own `chat_template` + EOS ids.
+One binary, two subcommands: **`smlx chat`** (self-contained text chat — no
+Python; tokenizer via tokenizers-cpp + chat template via minja, both compiled
+in) and **`smlx ids`** (the bare engine: token ids in, ids out).
 
 ```sh
 # interactive chat (multi-turn; Ctrl-D or /exit to quit)
-./build/smlx_chat -m models/Qwen3-4B-MLX-4bit --no-think
+./build/smlx chat -m models/Qwen3-4B-MLX-4bit --no-think
 make repl MODEL=models/Qwen3-4B-MLX-4bit ARGS=--no-think     # same via make
 
 # single-shot (-p)
-./build/smlx_chat -m models/Qwen3-4B-MLX-4bit -p "What is the capital of France?" --no-think
+./build/smlx chat -m models/Qwen3-4B-MLX-4bit -p "What is the capital of France?" --no-think
 make chat MODEL=models/Llama-3.2-1B-Instruct-4bit PROMPT="Write a haiku." ARGS="--temp 0.8 --seed 1"
 
-# raw ids in/out (the core binary, token-ids only)
-./build/smlx \
+# raw token ids in/out
+./build/smlx ids \
   models/Llama-3.2-1B-Instruct-bf16/smlx.config.txt \
   models/Llama-3.2-1B-Instruct-bf16/model.safetensors \
   20 128000
 ```
 
-`smlx_chat` flags: `-m/--model` (required), `-p/--prompt` (single-shot; omit
+`smlx chat` flags: `-m/--model` (required), `-p/--prompt` (single-shot; omit
 for interactive), `--max` (answer-token budget, default 512), `--think-budget`
 (max thinking tokens before `</think>` is forced, default 4096; 0 disables —
 total decode = think-budget + max), `--temp`, `--top-k`, `--top-p`, `--seed`,
 `--raw`, `--no-think` (disables Qwen3 thinking mode; ignored by other models).
 
+`smlx ids` takes sampling/EOS via env vars (`SMLX_TEMP/TOP_K/TOP_P/SEED/EOS`).
+
 ## Sampling
 
-`smlx_chat` takes sampling flags directly: `--temp`, `--top-k`, `--top-p`,
-`--seed`. The core `smlx` ids-binary reads the same controls from env vars:
+`smlx chat` takes sampling as flags; `smlx ids` reads the same controls from
+env vars:
 
-| flag (`smlx_chat`) | env var (`smlx`) | default | meaning |
+| flag (`smlx chat`) | env var (`smlx ids`) | default | meaning |
 |---|---|---|---|
 | `--temp F`   | `SMLX_TEMP`  | 0   | 0 = argmax; >0 = sampling |
 | `--top-k K`  | `SMLX_TOP_K` | 0   | 0 = disabled |
 | `--top-p F`  | `SMLX_TOP_P` | 1.0 | 1.0 = disabled |
 | `--seed S`   | `SMLX_SEED`  | 0   | per-step key derived as `seed + offset` |
 
-The core binary also takes `SMLX_EOS` (comma-separated stop ids) to end decode
-early; `smlx_chat` derives stop ids automatically from the model's config.
+`smlx ids` also takes `SMLX_EOS` (comma-separated stop ids); `smlx chat`
+derives stop ids automatically from the model's config.
 
 ## Layout
 
 - `src/smlx.h`, `src/smlx.c` — **libsmlx** (model load, forward, KV cache, sampler).
   Public API: `smlx_config_load`, `smlx_model_load/free`, `smlx_session_new/free`,
   `smlx_generate`. Opaque handles, no mlx-c types in the API.
-- `src/main.c` — thin token-ids CLI on top of libsmlx (`smlx`)
-- `src/chat_main.cpp` — self-contained text chat (`smlx_chat`): tokenizers-cpp
-  + minja + libsmlx, no Python
+- `src/main.cpp` — unified `smlx` CLI: `chat` (tokenizers-cpp + minja, no
+  Python) and `ids` (raw token ids) subcommands on top of libsmlx
 - `examples/hello_lib.c` — minimal example linking against libsmlx
+- `examples/run_exported.c` — separate demo: runs a Python-exported `.mlxfn`
 - `thirdparty/mlx-c/` — in-tree mlx-c (built by CMake as a subdirectory)
 - `thirdparty/tokenizers-cpp/` — HF tokenizer (Rust, statically linked)
 - `thirdparty/minja/`, `thirdparty/nlohmann/` — vendored headers for chat templates

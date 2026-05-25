@@ -25,13 +25,13 @@ mlx-c. The current scope:
 | KV-cached prefill + decode | working (preallocated slots + `slice_update`) |
 | Sampling: greedy / temperature / top-k / top-p / seeded RNG | working |
 | EOS early-stop | working |
-| Streaming output | working (token-by-token in `smlx_chat`) |
-| Tokenizer integration | external (Python `tokenizers` wrapper) |
+| Streaming output | working (token-by-token in `smlx chat`) |
+| Tokenizer integration | built in (`tokenizers-cpp` + `minja`, no Python) |
 | C library API (`libsmlx`, opaque handles) | working |
 
-The whole runtime is `src/smlx.c` (~810 LOC) + `src/smlx.h` (~50 LOC). The CLI
-is `src/main.c` (~115 LOC). A `hello_lib.c` example shows linking against the
-library directly.
+The engine is `src/smlx.c` (~810 LOC) + `src/smlx.h` (~50 LOC). The unified CLI
+is `src/main.cpp` (`smlx chat` / `smlx ids` subcommands). A `hello_lib.c`
+example shows linking against the library directly.
 
 ## 2. Correctness verification
 
@@ -221,7 +221,7 @@ In rough order of importance:
 - **Sampling is correct but unoptimized.** Top-p does two argsorts and a
   take-along; could be fused. Negligible cost vs the forward pass.
 
-(Resolved: text I/O is no longer Python-only — `smlx_chat` links
+(Resolved: text I/O is no longer Python-only — `smlx chat` links
 `tokenizers-cpp` + `minja` and is fully self-contained, with single-shot
 (`-p`) and interactive modes. The only cost is a Rust toolchain at *build*
 time.)
@@ -238,7 +238,7 @@ These came up and were deliberately skipped:
   fit; the others would require separate dequant + matmul paths.
 
 (Previously deferred, now done: a self-contained text binary with embedded
-tokenizer + chat-template rendering — see `smlx_chat`. The Rust build-time
+tokenizer + chat-template rendering — see `smlx chat`. The Rust build-time
 dependency turned out to be acceptable for a fully Python-free runtime.)
 
 ---
